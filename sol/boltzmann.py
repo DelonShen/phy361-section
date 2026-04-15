@@ -9,44 +9,7 @@ Assuming:
 
 import numpy as np
 import scipy
-
-
-# ============================================================
-# PHYSICAL CONSTANTS (SI)
-# ============================================================
-
-c_SI = 2.99792458e8              # speed of light [m/s]
-c_km_s = c_SI / 1e3              # speed of light [km/s]
-k_B = 1.380649e-23               # Boltzmann constant [J/K]
-h_P = 6.62607015e-34             # Planck constant [J·s]
-m_e = 9.1093837015e-31           # electron mass [kg]
-G = 6.67430e-11                  # gravitational constant [m^3/kg/s^2]
-Mpc_in_m = 3.0856775814913673e22 # 1 Mpc in metres
-sigma_SB = 5.670374419e-8        # Stefan-Boltzmann constant [W/m^2/K^4]
-
-
-
-# Critical density for h = 1: rho_crit,100 = 3(100 km/s/Mpc)^2 /(8 pi G)
-_H100_SI = 100.0 * 1e3 / Mpc_in_m
-_rho_crit_100 = 3.0 * _H100_SI**2 / (8.0 * np.pi * G)
-
-
-# ============================================================
-# DEFAULT COSMOLOGICAL PARAMETERS (Planck 2018 best-fit ΛCDM)
-# see 1807.06209 Table 1
-# ============================================================
-
-cosmo = {
-    'Omega_b_h2': 0.02238,       # Omega_b h^2 - baryon physical density
-    'Omega_c_h2': 0.1201,        # Omega_c h^2 - CDM physical density
-    'h': 0.6732,                 # H_0 / (100 km/s/Mpc)
-    'n_s': 0.96605,              # scalar spectral index
-    'A_s': 2.1e-9,               # scalar amplitude at k_pivot
-    'tau_reion': 0.0544,         # reionization optical depth
-    'N_eff': 3.044,              # effective number of massless neutrino species
-    'T_cmb': 2.7255,             # CMB temperature today [K]
-    'Y_He': 0.2454,              # helium mass fraction by weight
-}
+from constants import *
 
 
 
@@ -55,6 +18,12 @@ cosmo = {
 # ============================================================
  
 bg = {}
+
+
+# Critical density for h = 1: rho_crit,100 = 3(100 km/s/Mpc)^2 /(8 pi G)
+_H100_SI = 100.0 * 1e3 / Mpc_in_m
+_rho_crit_100 = 3.0 * _H100_SI**2 / (8.0 * np.pi * G)
+
 
 
 # densities at present day
@@ -114,3 +83,85 @@ def density_fractions(a, bg):
 bg['tau0'] = conformal_time(1.0, bg)
 bg['a_eq'] = ((bg['rho_gamma'] + bg['rho_nu'])/ (bg['rho_c'] + bg['rho_b']))
 bg['tau_eq'] = conformal_time(bg['a_eq'], bg)
+
+
+# ============================================================
+# RECOMBINATION
+#   Peebles 3-level atom
+#   Assumes T_b(z) = T_CMB(z) [no baryon temperature evolution]
+#   Ignores helium recombination
+# ============================================================
+
+# $(CR \times T)^{3/2} = \left(\frac{m_e k_B T}{2\pi\hbar^2}\right)^{3/2}$
+CR = 2.0 * np.pi * m_e * k_B / h_P**2  # Saha prefactor [m^-2 K^-1]
+ 
+def saha_xe(T, n_H):
+    #Hydrogen Saha equilibrium x_e, `recombination.pdf` Eq. (1)
+    #solving for xe with positive root of quadratic equation
+    s = (CR * T)**1.5 * np.exp(-E_I / T) / n_H
+    return (-s + np.sqrt(s * s + 4.0 * s)) / 2.0
+
+def peebles_rhs(z, x_e, bg, return_C = False):
+    #Peebles ODE RHS of dx_e / dz, `recombination.pdf` Eq. (3)
+
+    a = 1.0 / (1.0 + z)
+    T = cosmo['T_cmb'] * (1.0 + z)
+    n_H = (1 - cosmo['Y_He']) * bg['rho_b'] / m_H * (1.0 + z)**3
+
+    H_SI = hubble(a, bg) * c_SI / Mpc_in_m  # Mpc^-1 -> s^-1
+
+    # Case-B recombination coefficient (Pequignot, Petitjean & Boisson 1991)
+    t4 = T / 1e4
+    alpha_B = a_PPB * t4**b_PPB / (1.0 + c_PPB * t4**d_PPB)
+
+    # Photoionization rate from n=2, by detailed balance:
+    beta_B = 0.25 * (CR * T)**1.5 * np.exp(-E_2_bind / T) * alpha_B
+
+    # Sobolev Lyman-alpha escape rate
+    #   R_Lya = 8 pi H / (3 n_{1s} lambda_Lya^3)
+    n_1s = (1.0 - x_e) * n_H
+    R_Lya = 8.0 * np.pi * H_SI / (3.0 * n_1s * lambda_Lya**3)
+
+    numer = 0.75 * R_Lya + 0.25 * Lambda_2s1s
+
+    #Peebles C-factor, `recombination.pdf` Eq. (2)
+    C = numer / (beta_B + numer)
+
+    if(return_C):
+        # return the Peebles C-factor
+        # instead of the RHS of the ODE
+        return C
+
+    recomb = n_H * x_e**2 * alpha_B
+    photoion = 4.0 * (1.0 - x_e) * beta_B * np.exp(-E_21 / T)
+    return C / (H_SI * (1.0 + z)) * (recomb - photoion)
+
+# z-sampling for recombination history
+nz = 10000
+z_arr = np.linspace(3000, 0, nz)
+xe_arr = np.empty(nz)
+
+# find redshift where x_e first drops below 0.99
+# to set IC for Peebles ODE
+IC_idx = None
+
+for i, z in enumerate(z_arr):
+    T = cosmo['T_cmb'] * (1.0 + z)
+    n_H = (1 - cosmo['Y_He']) * bg['rho_b'] / m_H * (1.0 + z)**3
+    xe_arr[i] = saha_xe(T, n_H)
+    if(xe_arr[i] < 0.99):
+        IC_idx = i
+        break
+
+
+# solve Peebles ODE after finding IC
+z_ode = z_arr[IC_idx:]
+sol = scipy.integrate.solve_ivp(
+    peebles_rhs, [z_ode[0], z_ode[-1]], [xe_arr[IC_idx]],
+    t_eval=z_ode, method='LSODA',
+    rtol=1e-8, atol=0.0,
+    args=(bg,)
+)
+
+n_sol = min(sol.y.shape[1], len(z_ode))
+xe_arr[IC_idx:IC_idx + n_sol] = sol.y[0, :n_sol]
