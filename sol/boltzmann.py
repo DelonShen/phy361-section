@@ -94,6 +94,9 @@ bg['tau_eq'] = conformal_time(bg['a_eq'], bg)
 
 # $(CR \times T)^{3/2} = \left(\frac{m_e k_B T}{2\pi\hbar^2}\right)^{3/2}$
 CR = 2.0 * np.pi * m_e * k_B / h_P**2  # Saha prefactor [m^-2 K^-1]
+
+bg['n_H'] = (1 - cosmo['Y_He']) * bg['rho_b'] / m_H # number density of hydrogen today
+
  
 def saha_xe(T, n_H):
     #Hydrogen Saha equilibrium x_e, `recombination.pdf` Eq. (1)
@@ -106,7 +109,7 @@ def peebles_rhs(z, x_e, bg, return_C = False):
 
     a = 1.0 / (1.0 + z)
     T = cosmo['T_cmb'] * (1.0 + z)
-    n_H = (1 - cosmo['Y_He']) * bg['rho_b'] / m_H * (1.0 + z)**3
+    n_H = bg['n_H'] * (1.0 + z)**3
 
     H_SI = hubble(a, bg) * c_SI / Mpc_in_m  # Mpc^-1 -> s^-1
 
@@ -137,8 +140,8 @@ def peebles_rhs(z, x_e, bg, return_C = False):
     return C / (H_SI * (1.0 + z)) * (recomb - photoion)
 
 # z-sampling for recombination history
-nz = 10000
-z_arr = np.linspace(3000, 0, nz)
+nz = 20000
+z_arr = np.linspace(6000, 0, nz)
 xe_arr = np.empty(nz)
 
 # find redshift where x_e first drops below 0.99
@@ -147,7 +150,7 @@ IC_idx = None
 
 for i, z in enumerate(z_arr):
     T = cosmo['T_cmb'] * (1.0 + z)
-    n_H = (1 - cosmo['Y_He']) * bg['rho_b'] / m_H * (1.0 + z)**3
+    n_H = bg['n_H'] * (1.0 + z)**3
     xe_arr[i] = saha_xe(T, n_H)
     if(xe_arr[i] < 0.99):
         IC_idx = i
@@ -165,3 +168,90 @@ sol = scipy.integrate.solve_ivp(
 
 n_sol = min(sol.y.shape[1], len(z_ode))
 xe_arr[IC_idx:IC_idx + n_sol] = sol.y[0, :n_sol]
+
+
+# ============================================================
+# REIONIZATION
+#   tanh model for H and He reionization mimicing CAMB
+# ============================================================
+
+
+bg['f_He'] = cosmo['Y_He'] / ((m_He4 / m_H) * (1.0 - cosmo['Y_He'])) # n(He) / n(H)
+akthom = sigma_T * bg['n_H'] * Mpc_in_m   # (n_P sigma_T) today, [Mpc^-1]
+
+# --- Reionization parameters (following CAMB defaults) ---
+_REION_DELTA_Z = 0.5         # H reion tanh width
+_REION_ZEXP = 1.5            # tanh argument exponent: tanh in (1+z)^{3/2}
+_HE_REION_Z = 3.5            # He+ -> He++ midpoint
+_HE_REION_DZ = 0.4           # He+ -> He++ width
+
+
+
+def _tanh_step_in_y(z, z_mid, delta_z, amplitude):
+    #tanh stepy used as H + He reionization model
+    y = (1.0 + z)**_REION_ZEXP
+    y_mid = (1.0 + z_mid)**_REION_ZEXP
+    delta_y = (_REION_ZEXP * (1.0 + z_mid)**(_REION_ZEXP - 1.0) * delta_z)
+    arg = (y_mid - y) / delta_y
+    return 0.5 * amplitude * (1.0 + np.tanh(arg))
+
+
+def reion_xe(z, z_re, f_He):
+    # tanh model for reionization of 
+    # (a) HI->HII + HeI->HeII and (b) HeII->HeIII
+    return (_tanh_step_in_y(z, z_re, _REION_DELTA_Z, 1.0 + f_He)    # (a)
+            + _tanh_step_in_y(z, _HE_REION_Z, _HE_REION_DZ, f_He))  # (b)
+
+
+def thomson_opacity(z_arr, x_e_arr, bg):
+    #Thomson opacity in conformal time:
+    a_arr = 1.0 / (1.0 + np.asarray(z_arr, dtype=float))
+    return x_e_arr * akthom / a_arr**2
+
+
+def optical_depth(eta_arr, tau_dot_arr):
+    # Optical depth tau(eta), assumes eta_arr is sorted s.t. z(eta) is decreasing
+    # optical_depth[0] returns tau at smallest eta (largest z) = total
+    return -scipy.integrate.cumulative_trapezoid(tau_dot_arr[::-1], eta_arr[::-1], initial=0.0,)[::-1]
+
+
+def find_z_re(target_tau, bg):
+    #find z_re such that optical depth to reionization matches input cosmology with binary search
+
+    f_He = bg['f_He']
+    
+    # grid for computing tau integral
+    z_max = 30.0 + 8.0 * _REION_DELTA_Z
+    z_grid = np.linspace(z_max, 0.0, 2000)
+    a_grid = 1.0 / (1.0 + z_grid)
+    eta_grid = conformal_time(a_grid, bg)
+
+
+    def tau_reion(z_re):
+        x_e = reion_xe(z_grid, z_re, f_He)
+        tau_dot = thomson_opacity(z_grid, x_e, bg)
+        # reion optical depth integrated back to the present.
+        return optical_depth(eta_grid, tau_dot)[0]
+
+    # define bounds of binary search
+    z_lo, z_hi = 2.0, 30.0
+    tau_bot, tau_top = None, None
+    for _ in range(1000):
+        z_mid = 0.5 * (z_lo + z_hi)
+        tau_mid = tau_reion(z_mid)
+        if tau_mid > target_tau:
+            z_hi, tau_top = z_mid, tau_mid
+        else:
+            z_lo, tau_bot = z_mid, tau_mid
+        if abs(z_hi - z_lo) < 1e-3:
+            break
+
+    return z_hi
+
+
+# compute reionization history
+z_re = find_z_re(cosmo['tau_reion'], bg)
+x_e_reion = reion_xe(z_arr, z_re, bg['f_He'])
+
+# include reionization in ionization history 
+xe_arr = np.maximum(x_e_reion, xe_arr)

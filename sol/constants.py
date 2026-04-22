@@ -39,6 +39,7 @@ cosmo = {
 # RECOMBINATION CONSTANTS 
 # ============================================================
 m_H = 1.673575e-27               # hydrogen atom mass [kg]
+m_He4 = 6.646479073e-27          # helium-4 atom mass [kg]
 
 Lambda_2s1s = 8.2206             # two-photon decay rate 2s -> 1s [s^-1] (Labzowsky et al 2005)
 
@@ -57,3 +58,8 @@ a_PPB = 4.309e-19
 b_PPB = -0.6166
 c_PPB = 0.6703
 d_PPB = 0.5300
+
+# ============================================================
+# REIONIZATION CONSTANTS 
+# ============================================================
+sigma_T = 6.6524587321e-29       # Thomson cross-section [m^2]
