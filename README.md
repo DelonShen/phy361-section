@@ -7,3 +7,4 @@ The goal of section this quarter to guide you through writing your own Einstein-
 | 2 | Recombination (three-level atom) | [[handout]](recombination.pdf) [[notes]](lecture_notes/section02.pdf) |
 | 3 | Gunn-Peterson Optical Depth, Reionization | [[handout]](reionization.pdf) [[notes]](lecture_notes/section03.pdf) |
 | 4 | N-body simulations, Zeldovich Pancake | [[handout]](pancake.pdf) [[notes]](lecture_notes/section04.pdf) [[extra on ZA]](aux/HW07_Sol.pdf) |
+| 5 | Intro to perturbations: Neutrino-induced phase shift | [[handout]](nu_phase_shift.pdf) [[notes]](lecture_notes/section05.pdf) |
