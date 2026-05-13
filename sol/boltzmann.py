@@ -179,7 +179,7 @@ xe_arr[IC_idx:IC_idx + n_sol] = sol.y[0, :n_sol]
 bg['f_He'] = cosmo['Y_He'] / ((m_He4 / m_H) * (1.0 - cosmo['Y_He'])) # n(He) / n(H)
 akthom = sigma_T * bg['n_H'] * Mpc_in_m   # (n_P sigma_T) today, [Mpc^-1]
 
-# --- Reionization parameters (following CAMB defaults) ---
+# Reionization parameters (following CAMB defaults)
 _REION_DELTA_Z = 0.5         # H reion tanh width
 _REION_ZEXP = 1.5            # tanh argument exponent: tanh in (1+z)^{3/2}
 _HE_REION_Z = 3.5            # He+ -> He++ midpoint
@@ -255,3 +255,268 @@ x_e_reion = reion_xe(z_arr, z_re, bg['f_He'])
 
 # include reionization in ionization history 
 xe_arr = np.maximum(x_e_reion, xe_arr)
+
+# ============================================================
+# PERTURBATIONS
+# ============================================================
+
+# interpolating optical depth and thompson opacity
+_a_pert = np.logspace(-10, 0, 4000)
+_tau_pert = conformal_time(_a_pert, bg)
+_z_pert = 1.0 / _a_pert - 1.0
+
+_xe_pert = np.where(
+    _z_pert > z_arr[0],
+    1.0, # assume fully ionized for z > z_arr[0]
+    np.interp(_z_pert, z_arr[::-1], xe_arr[::-1]),
+)
+_tau_dot_pert = thomson_opacity(_z_pert, _xe_pert, bg)   # 1/Mpc
+
+def scale_factor_from_tau(tau):
+    return np.interp(tau, _tau_pert, _a_pert)
+
+def tau_dot_of_tau(tau):
+    return np.interp(tau, _tau_pert, _tau_dot_pert)
+
+
+# state vector for TCA
+LMAX_G = 15       # photon multipoles
+LMAX_N = 15       # massless-neutrino multipoles
+
+IDX_DC,  IDX_UC  = 0, 1                 # CDM:    d_c, u_c
+IDX_DB,  IDX_UB  = 2, 3                 # baryon: d_b, u_b 
+IDX_DG,  IDX_UG, IDX_PIG = 4, 5, 6      # photon monopole/dipole/quadrupole
+IDX_DLG_BASE = 7                        # d_{l,g} for l = 3..LMAX_G
+_NG = LMAX_G - 2
+
+IDX_DN  = IDX_DLG_BASE + _NG            # neutrino d_n
+IDX_UN  = IDX_DN + 1                    # neutrino u_n
+IDX_PIN = IDX_DN + 2                    # neutrino pi_n
+IDX_DLN_BASE = IDX_PIN + 1              # d_{l,n} for l = 3..LMAX_N
+_NN = LMAX_N - 2
+
+NSTATE = IDX_DLN_BASE + _NN
+
+
+ZETA = -1.0 # chosen to match default CAMB convention, really we're just computing transfer function here
+
+
+def metric_perturbations(d_g, u_g, pi_g, d_n, u_n, pi_n,
+                         d_c, u_c, d_b, u_b, a, aH, k, bg):
+    rho_g = bg['rho_gamma'] / a**4
+    rho_n = bg['rho_nu']    / a**4
+    rho_c = bg['rho_c']     / a**3
+    rho_b = bg['rho_b']     / a**3
+
+    factor  = 4.0 * np.pi * G * a**2 * (Mpc_in_m / c_SI)**2
+
+    gamma_g = factor * (4.0/3.0 * rho_g)
+    gamma_n = factor * (4.0/3.0 * rho_n)
+    gamma_c = factor * rho_c
+    gamma_b = factor * rho_b
+    gamma_tot = gamma_g + gamma_n + gamma_c + gamma_b
+
+    d_tot  = (gamma_g*d_g + gamma_n*d_n + gamma_c*d_c + gamma_b*d_b) / gamma_tot
+    u_tot  = (gamma_g*u_g + gamma_n*u_n + gamma_c*u_c + gamma_b*u_b) / gamma_tot
+    pi_tot = (gamma_g * pi_g + gamma_n * pi_n) / gamma_tot
+
+    Psi = -gamma_tot * (d_tot + 3.0 * aH * u_tot) / (k**2 + 3.0 * gamma_tot)
+    Phi = Psi - 3.0 * gamma_tot * pi_tot
+    return Phi, Psi
+
+
+def initial_state(tau_init, k, bg):
+    R_nu = bg['rho_nu'] / (bg['rho_gamma'] + bg['rho_nu'])
+    u    = 5.0 * tau_init * ZETA / (15.0 + 4.0 * R_nu)
+
+    y = np.zeros(NSTATE)
+    y[IDX_DC]  = -3.0 * ZETA
+    y[IDX_UC]  = u
+
+    y[IDX_DB]  = -3.0 * ZETA
+    y[IDX_UB]  = u                          # u_b = u_g at IC (TCA)
+
+    y[IDX_DG]  = -3.0 * ZETA
+    y[IDX_UG]  = u
+    # y[IDX_PIG] = 0; higher d_{l,g} = 0; higher d_{l,n} = 0 (set by np.zeros)
+
+    y[IDX_DN]  = -3.0 * ZETA
+    y[IDX_UN]  = u
+    y[IDX_PIN] = tau_init**2 * 2.0 * ZETA / (3.0 * (15.0 + 4.0 * R_nu))
+
+    return y
+
+
+
+def _cdm_rhs(y, k, aH, Phi, dy):
+    # same in TCA and full system
+    # so we make it its own function
+    dy[IDX_DC] = -k**2 * y[IDX_UC]
+    dy[IDX_UC] = -aH * y[IDX_UC] + Phi
+    return dy
+
+
+def _neutrino_rhs(y, k, tau, Phi, Psi, dy):
+    # same in TCA and full system
+    # so we make it its own function
+    d_n  = y[IDX_DN]
+    u_n  = y[IDX_UN]
+    pi_n = y[IDX_PIN]
+
+    dy[IDX_DN]  = -k**2 * u_n
+    dy[IDX_UN]  = d_n / 3.0 - k**2 * pi_n + (Phi + Psi)
+    dy[IDX_PIN] = (4.0/15.0) * u_n - (2.0/5.0) * k**2 * y[IDX_DLN_BASE]
+
+    # higher-l recursion (l = 3..LMAX_N - 1)
+    for l in range(3, LMAX_N):
+        d_lm1 = 1.5 * pi_n if l == 3 else y[IDX_DLN_BASE + (l - 4)]
+        d_lp1 = y[IDX_DLN_BASE + (l - 2)]
+        dy[IDX_DLN_BASE + (l - 3)] = (l/(2*l+1)) * d_lm1 - ((l+1)/(2*l+1)) * k**2 * d_lp1
+
+    dy[IDX_DLN_BASE + (LMAX_N - 3)] = (
+        y[IDX_DLN_BASE + (LMAX_N - 4)]
+        - ((LMAX_N + 1) / tau) * y[IDX_DLN_BASE + (LMAX_N - 3)]
+    )
+
+    return dy
+
+
+def tca_rhs(tau, y, k, bg):
+    # very similar to what we did last week in `nu_phase_shift.py`
+    a  = scale_factor_from_tau(tau)
+    aH = a * hubble(a, bg)
+
+    d_g = y[IDX_DG]; u_g = y[IDX_UG]
+    d_b = y[IDX_DB]
+    d_c = y[IDX_DC]; u_c = y[IDX_UC]
+    d_n = y[IDX_DN]; u_n = y[IDX_UN]; pi_n = y[IDX_PIN]
+    u_b = u_g
+
+    Phi, Psi = metric_perturbations(d_g, u_g, 0.0, d_n, u_n, pi_n,
+                                     d_c, u_c, d_b, u_b, a, aH, k, bg)
+
+    rho_g = bg['rho_gamma'] / a**4
+    rho_b = bg['rho_b']     / a**3
+    R_b   = 3.0 * rho_b / (4.0 * rho_g)
+
+    tau_dot = tau_dot_of_tau(tau)
+    tau_c = 1.0 / tau_dot
+    tau_d = (tau_c / 6.0) * (1.0 - 14.0/(15.0*(1.0+R_b)) + 1.0/(1.0+R_b)**2)
+    friction = aH * R_b / (1.0 + R_b) + 2.0 * k**2 * tau_d
+
+    dy = np.zeros(NSTATE)
+
+    # Photon: continuity + TCA
+    dy[IDX_DG] = -k**2 * u_g
+    dy[IDX_UG] = (-friction * u_g
+                  + d_g / (3.0 * (1.0 + R_b))
+                  + (Phi + Psi / (1.0 + R_b)))
+
+    # Baryon: locked to photons
+    dy[IDX_DB] = -k**2 * u_g
+    dy[IDX_UB] = dy[IDX_UG]
+
+    dy = _cdm_rhs(y, k, aH, Phi, dy)
+    dy = _neutrino_rhs(y, k, tau, Phi, Psi, dy)
+    return dy
+
+
+def solve_perturbations_tca(k, tau_max=bg['tau0'],):
+    tau_init = 1e-3 / k
+
+    y0 = initial_state(tau_init, k, bg)
+    sol_tca = scipy.integrate.solve_ivp(
+        tca_rhs, (tau_init, tau_max), y0,
+        args=(k, bg), method='LSODA',
+        rtol=1e-8, atol=1e-10, dense_output=True,
+    )
+
+    return sol_tca
+
+# The above is enough to test code against CAMB in the tight-coupling regime
+# I do this in `section06_tests_TCA.py` 
+
+def full_rhs(tau, y, k, bg):
+    a  = scale_factor_from_tau(tau)
+    aH = a * hubble(a, bg)
+
+    d_c = y[IDX_DC]; u_c = y[IDX_UC]
+    d_b = y[IDX_DB]; u_b = y[IDX_UB]
+    d_g = y[IDX_DG]; u_g = y[IDX_UG]; pi_g = y[IDX_PIG]
+    d_n = y[IDX_DN]; u_n = y[IDX_UN]; pi_n = y[IDX_PIN]
+
+    Phi, Psi = metric_perturbations(d_g, u_g, pi_g, d_n, u_n, pi_n,
+                                     d_c, u_c, d_b, u_b, a, aH, k, bg)
+
+    rho_g = bg['rho_gamma'] / a**4
+    rho_b = bg['rho_b']     / a**3
+    R_b   = 3.0 * rho_b / (4.0 * rho_g)
+
+
+    tau_dot = tau_dot_of_tau(tau)
+
+    dy = np.empty(NSTATE)
+
+    dy = _cdm_rhs(y, k, aH, Phi, dy)
+
+    # Baryon: continuity + Euler
+    dy[IDX_DB] = -k**2 * u_b
+    dy[IDX_UB] = -aH * u_b + Phi + 1 / R_b * tau_dot * (u_g - u_b)
+
+    # Photon: continuity + Euler
+    dy[IDX_DG] = -k**2 * u_g
+    dy[IDX_UG] = (d_g / 3.0 - k**2 * pi_g + (Phi + Psi)
+                  + tau_dot * (u_b - u_g))
+
+    # Photon quadrupole
+    dy[IDX_PIG] = (4.0/15.0) * u_g - (2.0/5.0) * k**2 * y[IDX_DLG_BASE] - tau_dot * pi_g
+
+    # higher-l photon recursion (l = 3..LMAX_G - 1)
+    for l in range(3, LMAX_G):
+        d_lm1 = 1.5 * pi_g if l == 3 else y[IDX_DLG_BASE + (l - 4)]
+        d_lp1 = y[IDX_DLG_BASE + (l - 2)]
+        dy[IDX_DLG_BASE + (l - 3)] = (
+            (l/(2*l+1)) * d_lm1 - ((l+1)/(2*l+1)) * k**2 * d_lp1
+            - tau_dot * y[IDX_DLG_BASE + (l - 3)]
+        )
+
+    dy[IDX_DLG_BASE + (LMAX_G - 3)] = (
+        y[IDX_DLG_BASE + (LMAX_G - 4)]
+        - ((LMAX_G + 1) / tau) * y[IDX_DLG_BASE + (LMAX_G - 3)]
+        - tau_dot * y[IDX_DLG_BASE + (LMAX_G - 3)]
+    )
+
+    dy = _neutrino_rhs(y, k, tau, Phi, Psi, dy)
+    return dy
+
+
+
+def solve_perturbations(k, tau_max=bg['tau0']):
+    tau_init = 1e-3 / k
+
+    # Find when tau_c * k > 0.02.
+    lo, hi = tau_init, tau_max
+    while hi - lo > 1e-6:
+        mid = 0.5 * (lo + hi)
+        if k / tau_dot_of_tau(mid) > 0.02:
+            hi = mid
+        else:
+            lo = mid
+    tau_switch = hi
+
+    # Stage 1: TCA
+    y0 = initial_state(tau_init, k, bg)
+    sol_tca = scipy.integrate.solve_ivp(
+        tca_rhs, (tau_init, tau_switch), y0,
+        args=(k, bg), method='LSODA',
+        rtol=1e-8, atol=1e-10, dense_output=True,
+    )
+
+    # Stage 2: full
+    sol_full = scipy.integrate.solve_ivp(
+        full_rhs, (tau_switch, tau_max), sol_tca.y[:, -1],
+        args=(k, bg), method='LSODA',
+        rtol=1e-8, atol=1e-10, dense_output=True,
+    )
+
+    return sol_tca, sol_full
