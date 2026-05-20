@@ -9,3 +9,4 @@ The goal of section this quarter to guide you through writing your own Einstein-
 | 4 | N-body simulations, Zeldovich Pancake | [[handout]](pancake.pdf) [[notes]](lecture_notes/section04.pdf) [[extra on ZA]](aux/HW07_Sol.pdf) |
 | 5 | Intro to perturbations: Neutrino-induced phase shift | [[handout]](nu_phase_shift.pdf) [[notes]](lecture_notes/section05.pdf) |
 | 6 | Perturbations: TCA and full system | [[handout]](perturbations.pdf) [[notes]](lecture_notes/section06.pdf) |
+| 7 | Matter power spectrum, Photon transfer function, Cosmic web | [[handout]](fun.pdf)  |
