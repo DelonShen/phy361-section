@@ -469,7 +469,7 @@ def full_rhs(tau, y, k, bg):
                   + tau_dot * (u_b - u_g))
 
     # Photon quadrupole
-    dy[IDX_PIG] = (4.0/15.0) * u_g - (2.0/5.0) * k**2 * y[IDX_DLG_BASE] - tau_dot * pi_g
+    dy[IDX_PIG] = (4.0/15.0) * u_g - (2.0/5.0) * k**2 * y[IDX_DLG_BASE] - 9/10 * tau_dot * pi_g
 
     # higher-l photon recursion (l = 3..LMAX_G - 1)
     for l in range(3, LMAX_G):
@@ -520,3 +520,250 @@ def solve_perturbations(k, tau_max=bg['tau0']):
     )
 
     return sol_tca, sol_full
+
+# ============================================================
+# ANGULAR SPECTRUM
+# ============================================================
+
+from scipy.special import spherical_jn
+from scipy.interpolate import CubicSpline
+ 
+def to_standard(y, k, a):
+    # we've been using non-standard perturbation variables up until now.
+    # for the angular projection, I think it's easiest to convert back to
+    # standard perturbation variables that are used in e.g. CAMB, CLASS and
+    # described in detail in Ma & Bertschinger 
+    # we don't have to do this though...
+
+    aH = a * hubble(a, bg)
+
+    d_c = y[IDX_DC];  u_c = y[IDX_UC]
+    d_b = y[IDX_DB];  u_b = y[IDX_UB]
+    d_g = y[IDX_DG];  u_g = y[IDX_UG];  pi_g = y[IDX_PIG]
+    d_n = y[IDX_DN];  u_n = y[IDX_UN];  pi_n = y[IDX_PIN]
+
+    # I'm calling our non-standard perturbation variables BS since 
+    # we're referencing BashinskySeljak2003
+    Phi_BS, Psi_BS = metric_perturbations(
+        d_g, u_g, pi_g, d_n, u_n, pi_n,
+        d_c, u_c, d_b, u_b, a, aH, k, bg,
+    )
+
+    # Ma & Bertschinger opposite potential convnetion from Bashinsky & Seljak
+    phi_N = Psi_BS
+    psi_N = Phi_BS
+
+    delta_g = (4.0 / 3.0) * (d_g + 3.0 * phi_N)
+    delta_n = (4.0 / 3.0) * (d_n + 3.0 * phi_N)
+    delta_c = d_c + 3.0 * phi_N
+    delta_b = d_b + 3.0 * phi_N
+
+    theta_g = k**2 * u_g
+    theta_n = k**2 * u_n
+    theta_c = k**2 * u_c
+    theta_b = k**2 * u_b
+
+    # exercise for the reader:
+    # compare definitions in Bashinsky & Seljak to Ma & Bertschinger
+    # adn convince yourself this is true
+    sigma_g = k**2 * pi_g
+    sigma_n = k**2 * pi_n
+    F_g_2 = 2.0 * sigma_g
+    F_n_2 = 2.0 * sigma_n
+
+    F_g_higher = np.array([
+        (4.0 / 3.0) * k**l * y[IDX_DLG_BASE + (l - 3)]
+        for l in range(3, LMAX_G + 1)
+    ])
+    F_n_higher = np.array([
+        (4.0 / 3.0) * k**l * y[IDX_DLN_BASE + (l - 3)]
+        for l in range(3, LMAX_N + 1)
+    ])
+
+    return {
+        'phi_N': phi_N,        'psi_N': psi_N,
+        'delta_g': delta_g,    'theta_g': theta_g,    'sigma_g': sigma_g,
+        'delta_n': delta_n,    'theta_n': theta_n,    'sigma_n': sigma_n,
+        'delta_c': delta_c,    'theta_c': theta_c,
+        'delta_b': delta_b,    'theta_b': theta_b,
+        'F_g_2': F_g_2,        'F_n_2': F_n_2,
+        'F_g_higher': F_g_higher,
+        'F_n_higher': F_n_higher,
+    }
+
+
+
+
+
+def visibility_grid(etas):
+    # returns all the quanties related to visibility we'll need
+    # in particular (g, g_dot, exptau) given input conformal time
+
+    etas = np.asarray(etas, dtype=float)
+
+    tau_dot = tau_dot_of_tau(etas)
+    tau = optical_depth(etas, tau_dot)
+    exptau = np.exp(-tau)
+
+    g_vis = tau_dot * exptau
+
+    # will use cubic spline here for easy derivatives
+    spl_g = CubicSpline(etas, g_vis)
+    g_dot = spl_g(etas, 1)
+
+    return g_vis, g_dot, exptau
+
+
+def los_source_grid(k, taus):
+    # assemble SW + doppler + ISW
+
+    # evolve perturbations
+    taus = np.asarray(taus, dtype=float)
+    sol_tca, sol_full = solve_perturbations(k, tau_max=taus[-1])
+    tau_switch = sol_full.t[0]
+
+    # sample perturbations on input tau grid
+    y_grid = np.zeros((NSTATE, len(taus)))
+    mask_tca = taus < tau_switch
+    mask_full = ~mask_tca
+    if np.any(mask_tca):
+        y_grid[:, mask_tca] = sol_tca.sol(taus[mask_tca])
+    if np.any(mask_full):
+        y_grid[:, mask_full] = sol_full.sol(taus[mask_full])
+
+    # convert to standard perturbation variables
+    delta_g = np.empty(len(taus))
+    theta_b = np.empty(len(taus))
+    phi_N   = np.empty(len(taus))
+    psi_N   = np.empty(len(taus))
+
+    for i, tau in enumerate(taus):
+        a = scale_factor_from_tau(tau)
+        st = to_standard(y_grid[:, i], k, a)
+        delta_g[i] = st['delta_g']
+        theta_b[i] = st['theta_b']
+        phi_N[i]   = st['phi_N']
+        psi_N[i]   = st['psi_N']
+
+
+    # take derivative with CubicSpline
+    theta_b_dot = CubicSpline(taus, theta_b)(taus, 1)
+    phi_N_dot   = CubicSpline(taus, phi_N)(taus, 1)
+    psi_N_dot   = CubicSpline(taus, psi_N)(taus, 1)
+
+    g_vis, g_dot, exptau = visibility_grid(taus)
+
+    # compute components of source function
+    ISW      = exptau * (phi_N_dot + psi_N_dot)
+    monopole = g_vis * (delta_g / 4.0 + psi_N)
+    doppler  = (g_dot * theta_b + g_vis * theta_b_dot) / k**2
+
+    return ISW + monopole + doppler, {
+        'g_vis': g_vis, 'g_dot': g_dot, 'exptau': exptau,
+        'delta_g': delta_g, 'theta_b': theta_b,
+        'phi_N': phi_N, 'psi_N': psi_N,
+        'ISW': ISW, 'monopole': monopole, 'doppler': doppler,
+    }
+
+
+def default_tau_grid(bg, n_pre=40, n_rec=80, n_post=80):
+    # really what we want to resolve very well is peak of visibility function
+    # around recombination so we sample densly there
+    tau_pre = np.geomspace(0.5, 200.0, n_pre)
+    tau_rec = np.linspace(200.0, 360.0, n_rec)[1:]
+    tau_post = np.geomspace(360.0, bg['tau0'] * 0.99999, n_post)[1:]
+    return np.concatenate([tau_pre, tau_rec, tau_post])
+
+def default_k_grids(bg):
+    # constructing a good k-grid to sample so that 
+    # the code is accurate without being too slow is a bit of an art...
+    # here I'll copy something like CAMB's choice
+    # the reason this is so tricky is because we have two oscillating
+    # things we need to integrate over:
+    # 1. spherical bessel function j_l(k chi)
+    # 2. acoustic oscillations in primordial plasma
+
+    DKN_LINEAR    = 1.27e-4
+    DLNK_LOG      = 0.05
+    Q_LOG_SWITCH  = 0.002
+    QMIN          = 0.1 / bg['tau0']
+    QMAX          = 0.4
+    n_source      = 300
+
+    k_source = np.logspace(np.log10(QMIN), np.log10(QMAX), n_source)
+
+    n_log    = max(2, int(np.log(Q_LOG_SWITCH / QMIN) / DLNK_LOG) + 1)
+    k_log    = np.logspace(np.log10(QMIN), np.log10(Q_LOG_SWITCH), n_log)
+
+    n_lin    = int((QMAX - Q_LOG_SWITCH) / DKN_LINEAR) + 1
+    k_lin    = Q_LOG_SWITCH + np.arange(1, n_lin) * DKN_LINEAR
+    k_lin    = k_lin[k_lin <= QMAX]
+
+    k_dense  = np.concatenate([k_log, k_lin])
+
+    return k_source, k_dense
+
+def default_l_grid():
+    # Sparse at high l (where C_l is smooth), dense at low l (acoustic peaks).
+    return np.concatenate([np.arange(2, 200), np.arange(200, 600, 2), np.arange(600, 2000, 5)])
+
+
+def delta_l_k(l_arr, k, S_T_grid, taus):
+    # basically computes Eq.(B.42) of Baumann
+    # but with a sneaky trick to absorb
+    # j_l', spherical Bessel function derivative 
+    # into doppler term in source function
+    # (exercise: work this out, it's integration by parts of the j_l' term)
+    l_arr = np.asarray(l_arr, dtype=int)
+    taus = np.asarray(taus, dtype=float)
+    tau0 = bg['tau0']
+    x = k * (tau0 - taus)
+
+    out = np.empty(len(l_arr), dtype=float)
+    for i, l in enumerate(l_arr):
+        jl = spherical_jn(int(l), x)
+        out[i] = scipy.integrate.trapezoid(S_T_grid * jl, taus)
+
+    return out
+
+def cl_tt(taus=None, k_source=None, k_dense=None, l_arr=None):
+    # computes the CMB angular power spectrum! (only T)
+
+    # use default choices of sampling
+    if taus is None:
+        taus = default_tau_grid(bg, n_pre=60, n_rec=120, n_post=140)
+    if k_source is None or k_dense is None:
+        k_source_def, k_dense_def = default_k_grids(bg)
+        if k_source is None: k_source = k_source_def
+        if k_dense  is None: k_dense  = k_dense_def
+    if l_arr is None:
+        l_arr = default_l_grid()
+
+    taus     = np.asarray(taus, dtype=float)
+    k_source = np.asarray(k_source, dtype=float)
+    k_dense  = np.asarray(k_dense, dtype=float)
+    l_arr    = np.asarray(l_arr, dtype=int)
+
+    # get source function
+    S_src = np.array([los_source_grid(kk, taus)[0] for kk in k_source])
+
+    # interpolate source function onto dense k.
+    S_dense = np.array([CubicSpline(np.log(k_source), S_src[:, it])(np.log(k_dense))
+                        for it in range(len(taus))]).T
+
+    # compute Delta_l_k with dense cubic interpolation
+    Dlk = np.array([delta_l_k(l_arr, kk, S_dense[ik, :], taus)
+                    for ik, kk in enumerate(k_dense)]).T
+
+    # Integrate in k against primordial spectrum to get angular power spectrum
+    # C_l = 4 pi int d(ln k) Delta_zeta^2(k) Delta_l(k)^2 (Baumann Eq.(B.44)).
+    ln_k          = np.log(k_dense)
+    Delta2_zeta   = cosmo['A_s'] * (k_dense / 0.05)**(cosmo['n_s'] - 1)
+    T_cmb_muK     = cosmo['T_cmb'] * 1e6
+
+    # return l(l+1)C_l/2 pi instead of raw C_l
+    Dl = np.array([4*np.pi * np.trapezoid(Delta2_zeta * Dlk[il]**2, ln_k)
+                   * T_cmb_muK**2 * l_arr[il] * (l_arr[il]+1) / (2*np.pi)
+                   for il in range(len(l_arr))])
+
+    return l_arr, Dl
